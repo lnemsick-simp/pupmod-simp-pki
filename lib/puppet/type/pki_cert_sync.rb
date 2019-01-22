@@ -1,4 +1,5 @@
 Puppet::Type.newtype(:pki_cert_sync) do
+  require 'puppet/parameter/boolean'
   require 'puppet/util/selinux'
   include Puppet::Util::SELinux
 
@@ -51,20 +52,52 @@ Puppet::Type.newtype(:pki_cert_sync) do
     end
   end
 
-  newparam(:purge, :boolean => true) do
+  newparam(:purge, :boolean => true, :parent => Puppet::Parameter::Boolean) do
     desc = <<-EOM
-      Whether or not to purge the target directory (:name). In general, you
+      Whether to purge the target directory (:name). In general, you
       will want to do this to ensure that systems do not get inappropriate
       CAs added locally.
     EOM
 
-    newvalues(:true,:false)
-    defaultto :true
+    defaultto true
+  end
+
+  newparam(:generate_cacerts_file, :boolean => true, :parent => Puppet::Parameter::Boolean) do
+    desc = <<-EOM
+      Whether to generate an aggregate CA certificate file, cacerts.pem,
+      in the target directory from the certificates found in the source
+      directory.
+
+      When true, the cacerts.pem file will be generated in the target
+      directory, overwriting any existing cacerts.pem file. In addition,
+      the X509 certificate headers will be removed from that file, if
+      :strip_cacerts_headers is true.
+
+      When false and a cacerts.pem file already exists in the source
+      directory, this file will be handled as follows:
+
+      - If :strip_cacerts_headers is false, the file will be sync'd
+        from the source directory to the target directory.
+      - If :strip_cacerts_headers is true, a copy of the file with
+        its X509 certificate headers stripped will be written to the
+        target directory.
+    EOM
+    defaultto true
+  end
+
+  newparam(:strip_cacerts_headers, :boolean => true, :parent => Puppet::Parameter::Boolean) do
+    desc = <<-EOM
+      Whether to ensure the aggregate CA certificate file in the target
+      directory, cacerts.pem, has had its X509 certificate headers removed.
+      This option is a useful for applications that are unable to handle
+      those headers.
+    EOM
+    defaultto false
   end
 
   newproperty(:source) do
     desc = <<-EOM
-      The directory into which to copy all materials. All existing materials will be removed.
+      The directory from which to copy all materials.
     EOM
 
     validate do |value|
@@ -72,6 +105,10 @@ Puppet::Type.newtype(:pki_cert_sync) do
         fail Puppet::Error, "Source directory must be an absolute path, not '#{value}'"
     end
 
+    # is = Hash returned by provider's source() with the following format:
+    #   PEM_file -> link
+    #   PEM_file2 -> link2
+    #   ...
     def insync?(is)
       # In this case, we want to compare the contents of ourself and
       # self[:name].

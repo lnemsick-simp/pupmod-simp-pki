@@ -59,14 +59,21 @@
 # @param group
 #   The group of the directories/files that get copied
 #
-# @author Trevor Vaughan <tvaughan@onyxpoint.com>
+# @param strip_cacerts_headers
+#   Whether to strip the X509 certificate headers from the
+#   `$source/cacerts/cacerts.pem` file.  Only applies when that
+#   file already exists.  Useful for applications that are unable
+#   to handle those headers.
+#
+# @author https://github.com/simp/pupmod-simp-pki/graphs/contributors
 #
 define pki::copy (
-  Variant[Boolean,Enum['simp']]  $pki         = simplib::lookup('simp_options::pki', { 'default_value' => false}),
-  String                         $source      = simplib::lookup('simp_options::pki::source', { 'default_value' => '/etc/pki/simp/x509' }),
-  Optional[Stdlib::Absolutepath] $destination = undef,
-  String                         $owner       = 'root',
-  String                         $group       = 'root',
+  Variant[Boolean,Enum['simp']]  $pki                   = simplib::lookup('simp_options::pki', { 'default_value' => false}),
+  String                         $source                = simplib::lookup('simp_options::pki::source', { 'default_value' => '/etc/pki/simp/x509' }),
+  Optional[Stdlib::Absolutepath] $destination           = undef,
+  String                         $owner                 = 'root',
+  String                         $group                 = 'root',
+  Boolean                        $strip_cacerts_headers = false,
 ) {
 
   include '::pki::copy::apps_dir'
@@ -137,14 +144,43 @@ define pki::copy (
     show_diff => false
   }
 
-  file { "${_destination}/cacerts":
-    ensure    => 'directory',
-    owner     => $owner,
-    group     => $group,
-    mode      => '0640',
-    recurse   => true,
-    source    => "${source}/cacerts",
-    seltype   => 'cert_t',
-    show_diff => false
+  if $strip_cacerts_header  {
+    # This block will copy over the contents of the source directory to
+    # the destination and, if a ${_destination}/cacerts/cacerts.pem file
+    # exists, strip the headers from it. Existing files/directories
+    # uniquely found in the destination are preserved.
+
+    file { "${_destination}/cacerts":
+      ensure    => 'directory',
+      owner     => $owner,
+      group     => $group,
+      mode      => '0640',
+      recurse   => true,
+      seltype   => 'cert_t',
+      show_diff => false
+    }
+
+#FIXME? pass in group, owner, mode, selinux context
+    pki_cert_sync { "${_destination}/cacerts":
+      source                => "${source}/cacerts",
+      purge                 => false,
+      generate_cacerts_file => false,
+      strip_cacerts_headers => true
+    }
+  }
+  else {
+    # Simple (fast) sync. Certs in source are assumed to be properly set
+    # up. Existing files/directories uniquely found in the destination
+    # are preserved.
+    file { "${_destination}/cacerts":
+      ensure    => 'directory',
+      owner     => $owner,
+      group     => $group,
+      mode      => '0640',
+      recurse   => true,
+      source    => "${source}/cacerts",
+      seltype   => 'cert_t',
+      show_diff => false
+    }
   }
 }

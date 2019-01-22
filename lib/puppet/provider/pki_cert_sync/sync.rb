@@ -14,8 +14,10 @@ Puppet::Type.type(:pki_cert_sync).provide(:redhat) do
     @concatted_certs = ''
 
     Dir.chdir(src) do
-      # Get all the files, but not the symlinks or cacerts.pem.
       to_parse = Dir.glob('**/*').sort
+      @src_cacerts_file = to_parse.include?('cacerts.pem')
+
+      # Get all the files, but not the symlinks or cacerts.pem.
       to_parse.delete_if{|x| File.symlink?(x)}
       to_parse.delete_if{|x| x == 'cacerts.pem' }
 
@@ -34,7 +36,7 @@ Puppet::Type.type(:pki_cert_sync).provide(:redhat) do
           next
         end
 
-        @concatted_certs += IO.read(file)
+        @concatted_certs += IO.read(file) if @resource.generate_cacerts_file?
 
         cert_hash = sprintf("%08x",cert.subject.hash)
         hash_targets[cert_hash] ||= Array.new
@@ -59,17 +61,26 @@ Puppet::Type.type(:pki_cert_sync).provide(:redhat) do
       end
     end
 
-    @to_link['cacerts.pem'] = 'cacerts.pem'
+    if @resource.generate_cacerts_file? || @src_cacerts_file
+      # cacerts.pem needs to be in the target directory, so make sure it
+      # is in the list of files to examine in source_insync?() and purged
+      # in source=()
+      @to_link['cacerts.pem'] = 'cacerts.pem'
+    end
+
     @to_link
   end
 
+  # src = Hash returned by provider's source() with the following format:
+  #   PEM_file -> link
+  #   PEM_file2 -> link2
+  #   ...
+  # target = directory in which certs listed in src should be found
+  #
+  # If :purge type parameter is set, the target should only contain
+  # the certs listed in src
   def source_insync?(src,target)
-    # At this point src is a hash with the following format:
-    #   PEM_file -> link
-    #   PEM_file2 -> link2
-    #   ...
-    #
-    File.directory?(target) or Dir.mkdir(target, 755)
+    File.directory?(target) or Dir.mkdir(target, 0755)
 
     insync = true
     Dir.chdir(target) do
@@ -77,14 +88,14 @@ Puppet::Type.type(:pki_cert_sync).provide(:redhat) do
       # If we're purging, and the number of files is different, then we're
       # not in sync.
       files = Dir.glob('**/*').select { |f| File.file?(f) }
-      if files.count != src.to_a.flatten.uniq.count and resource[:purge] == :true
+      if files.count != src.to_a.flatten.uniq.count and @resource.purge?
         Puppet.debug("Different number of files from #{resource[:source]} to #{resource[:name]}")
         insync = false
       end
 
-      # If we're purging, and the number of directories is different, then we're
+      # If we're purging, and the list of directories is different, then we're
       # not in sync.
-      if resource[:purge] == :true
+      if @resource.purge?
         dirs = Dir.glob('**/*').select { |d| File.directory?(d) }
         unless dirs.uniq.sort == @directories.uniq.sort
           Puppet.debug("Different number of directories from #{resource[:source]} to #{resource[:name]}")
@@ -92,19 +103,22 @@ Puppet::Type.type(:pki_cert_sync).provide(:redhat) do
         end
       end
 
-      # If files the same length, but we have a file name that is
-      # different, then we're not in sync.
+      # If the target does not have a file name that is in the source,
+      # then we're not in sync.
       src.each_key do |k|
         unless files.include?(k)
-          Puppet.debug("Different filenames from #{resource[:source]} to #{resource[:name]}")
+          Puppet.debug("Not all files in #{resource[:source]} are found #{resource[:name]}")
           insync = false
           break
         end
       end
 
+      @generate_cacerts = @resource.generate_cacerts_file? or
+        (@src_cacerts_file and @resource.strip_cacerts_headers?)
+
       # If all files have the same name, then we need to compare each one.
       src.each_key do |file|
-        next if file == 'cacerts.pem'
+        next if ( (file == 'cacerts.pem') && @generate_cacerts )
         # If we've gotten here, we need to exclude any target that doesn't
         # exist for the purge settings.
         if File.file?(file) && file_diff(file,"#{resource[:source]}/#{file}")
@@ -125,7 +139,7 @@ Puppet::Type.type(:pki_cert_sync).provide(:redhat) do
     Dir.chdir(resource[:name]) do
 
       # Purge ALL THE THINGS
-      if resource[:purge] == :true
+      if @resource.purge?
         # Make sure not to delete directories or certs (and symlinks) that we might currently be using.
         (Dir.glob('**/*') - [@to_link.to_a].flatten - @directories.flatten).each do |to_purge|
           unless ([@to_link.to_a].flatten).any? { |s| s.include?(to_purge) }
@@ -144,13 +158,8 @@ Puppet::Type.type(:pki_cert_sync).provide(:redhat) do
       FileUtils.chmod(0644, '.sync_updated')
       # End garbage hacky code
 
-      if !File.exists?("#{resource[:name]}/cacerts.pem")
-        File.open("#{resource[:name]}/cacerts.pem", 'w') {|f| f.write(@concatted_certs)}
-        File.chmod(0644, "#{resource[:name]}/cacerts.pem")
-      else
-        !(IO.read("#{resource[:name]}/cacerts.pem").eql? @concatted_certs) and
-          File.open("#{resource[:name]}/cacerts.pem", 'w') {|f| f.write(@concatted_certs)}
-      end
+      # cacerts.pem is special...
+      handle_cacerts_file
 
       # Take care of directories first; make them if they don't already exist.
       @directories.each do |dir|
@@ -159,34 +168,32 @@ Puppet::Type.type(:pki_cert_sync).provide(:redhat) do
 
       # Now copy over those items that differ and link them.
       @to_link.each_pair do |src,link|
-        if File.exist?(src)
-          selinux_context = resource.get_selinux_current_context("#{resource[:name]}/#{src}")
-        else
-          selinux_context = resource.get_selinux_current_context("#{resource[:source]}/#{src}")
-        end
-
-        selinux_context.nil? and
-          Puppet.debug("Could not get selinux context for '#{resource[:source]}/#{src}'")
-
         unless src == 'cacerts.pem'
-          FileUtils.cp("#{resource[:source]}/#{src}",src,{:preserve => true})
-          resource.set_selinux_context("#{resource[:name]}/#{src}",selinux_context).nil? and
-            Puppet.debug("Could not set selinux context on '#{src}'")
-        end
+          selinux_context = get_selinux_context(src)
+          copy_file(src, selinux)
 
-        # Only link if the names are different.
-        if src != link
-          FileUtils.ln_sf(src,link)
-          # Have to set the SELinux context here too since symlinks can have
-          # different contexts than files.
-          resource.set_selinux_context("#{resource[:name]}/#{link}",selinux_context).nil? and
-            Puppet.debug("Could not set selinux context on link '#{link}'")
+          # Only link if the names are different.
+          if src != link
+            FileUtils.ln_sf(src,link)
+            # Have to set the SELinux context here too since symlinks can have
+            # different contexts than files.
+            resource.set_selinux_context("#{resource[:name]}/#{link}",selinux_context).nil? and
+              Puppet.debug("Could not set selinux context on link '#{link}'")
+          end
         end
       end
     end
   end
 
   # Helper Methods
+
+  def copy_file(src, selinux_context)
+    source = File.join(resource[:source], src)
+    dest = File.join(resource[:name], src)
+    FileUtils.cp(source, dest, {:preserve => true})
+    resource.set_selinux_context(dest, selinux_context).nil? and
+      Puppet.debug("Could not set selinux context on '#{dest}'")
+  end
 
   # Ok, this is definitely not DRY since this is in concat_build. However, I
   # haven't found a consistent way of having a common library of junk for
@@ -197,7 +204,7 @@ Puppet::Type.type(:pki_cert_sync).provide(:redhat) do
   # they do not.
   def file_diff(src, dest)
     unless File.exist?(src)
-      fail Puppet::Error,"Could not diff non-existant source file #{src}."
+      fail Puppet::Error,"Could not diff nonexistent source file #{src}."
     end
 
     # If the destination isn't there, it's different.
@@ -221,5 +228,72 @@ Puppet::Type.type(:pki_cert_sync).provide(:redhat) do
     s_file.close
     d_file.close
     return retval
+  end
+
+  def generate_cacerts_file
+    unless @resource.generate_cacerts_file?
+      @concatted_certs = IO.read(File.join(resource[:source], 'cacerts.pem'))
+    end
+
+    if @resource.strip_cacerts_headers?
+      content = strip_x509_headers(@concatted_certs)
+    else
+      content = @concatted_certs
+    end
+
+    cacerts_file = File.join(resource[:name], 'cacerts.pem')
+    if content.strip.empty?
+      Puppet.warning("File '#{cacerts_file}' is empty.")
+    end
+
+    unless File.exists?(cacerts_file)
+      File.open(cacerts_file, 'w') {|f| f.write(content)}
+      File.chmod(0644, cacerts_file)
+    else
+      !(IO.read(cacerts_file).eql? content) and
+          File.open(cacerts_file, 'w') {|f| f.write(content)}
+    end
+  end
+
+  def get_selinux_context(file)
+    if File.exist?(file)
+      selinux_context = resource.get_selinux_current_context("#{resource[:name]}/#{file}")
+    else
+      selinux_context = resource.get_selinux_current_context("#{resource[:source]}/#{file}")
+    end
+
+    selinux_context.nil? and
+      Puppet.debug("Could not get selinux context for '#{resource[:source]}/#{file}'")
+
+    selinux_context
+  end
+
+  def handle_cacerts_file
+    if @generate_cacerts
+      generate_cacerts_file
+    elsif @src_cacerts_file
+      copy_file('cacerts.pem', get_selinux_context('cacerts.pem'))
+    end
+  end
+
+  # Returns the contents of an X509 certificate with the headers stripped
+  def strip_x509_headers(cert_raw)
+    begin_regex = /^#{Regexp.escape('-----BEGIN CERTIFICATE-----')}$/
+    end_regex = /^#{Regexp.escape('-----END CERTIFICATE-----')}$/
+
+    cert_lines = []
+    cert_begin_found = false
+    cert_raw.split("\n").each do |line|
+      if cert_begin_found
+        cert_lines << line
+        cert_begin_found = false if line.match(end_regex)
+      else
+        if line.match(begin_regex)
+          cert_begin_found = true
+          cert_lines << line
+        end
+      end
+    end
+    cert_lines.join("\n")
   end
 end
