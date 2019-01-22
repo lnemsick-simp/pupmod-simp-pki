@@ -8,6 +8,9 @@ Puppet::Type.type(:pki_cert_sync).provide(:redhat) do
     src = resource[:source]
     File.directory?(src) or fail Puppet::Error, "'#{src}' is not a valid directory."
 
+    @generate_cacerts = @resource.generate_cacerts_file? or
+      (@src_cacerts_file and @resource.strip_cacerts_headers?)
+
     hash_targets = {}
     @to_link = {}
     @directories = []
@@ -113,8 +116,6 @@ Puppet::Type.type(:pki_cert_sync).provide(:redhat) do
         end
       end
 
-      @generate_cacerts = @resource.generate_cacerts_file? or
-        (@src_cacerts_file and @resource.strip_cacerts_headers?)
 
       # If all files have the same name, then we need to compare each one.
       src.each_key do |file|
@@ -187,9 +188,13 @@ Puppet::Type.type(:pki_cert_sync).provide(:redhat) do
 
   # Helper Methods
 
-  def copy_file(src, selinux_context)
-    source = File.join(resource[:source], src)
-    dest = File.join(resource[:name], src)
+  # copy file from the source directory to the target directory
+  # and attempt to set its Selinux context to selinux_context
+  #
+  # Fails if file does not exist in the source directory
+  def copy_file(file, selinux_context)
+    source = File.join(resource[:source], file)
+    dest = File.join(resource[:name], file)
     FileUtils.cp(source, dest, {:preserve => true})
     resource.set_selinux_context(dest, selinux_context).nil? and
       Puppet.debug("Could not set selinux context on '#{dest}'")

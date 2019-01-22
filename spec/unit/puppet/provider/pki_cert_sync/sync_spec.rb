@@ -1,122 +1,68 @@
 require 'spec_helper'
-require 'json'
-require 'yaml'
-require 'facter'
+require 'tmpdir'
 
-describe 'Puppet::Type.type(:tpm2_ownership).provider(:tpm2tools)' do
+provider_class = Puppet::Type.type(:pki_cert_sync).provider(:redhat)
 
-  let(:all_clear) {
-    YAML.safe_load(File.read(File.expand_path('spec/files/tpm2/mocks/tpm2_getcap_-c_properties-variable/clear-clear-clear.yaml')))
-  }
+describe provider_class do
+  # Test methods that do not rely upon internal provider state
+  context 'stateless methods' do
+    before(:all) do
+      @tmpdir = Dir.mktmpdir
+      @source_dir = File.join(@tmpdir, 'source')
+      FileUtils.mkdir_p(@source_dir)
 
-  let(:all_set) {
-    YAML.safe_load(File.read(File.expand_path('spec/files/tpm2/mocks/tpm2_getcap_-c_properties-variable/set-set-set.yaml')))
-  }
+      @target_dir = File.join(@tmpdir, 'target')
+      FileUtils.mkdir_p(@target_dir)
+    end
 
-  let(:mixed) {
-    YAML.safe_load(File.read(File.expand_path('spec/files/tpm2/mocks/tpm2_getcap_-c_properties-variable/set-set-clear.yaml')))
-  }
-  let (:expected_hash1) {{
-    :owner            => :clear,
-    :endorsement      => :clear,
-    :lockout          => :clear,
-    'reserved1'       => :clear,
-    'disableClear'    => :clear,
-    'inLockout'       => :clear,
-    'tpmGeneratedEPS' => :set,
-    'reserved2'       => :clear,
-  }}
+    after(:all) { FileUtils.remove_entry_secure @tmpdir }
 
+    let (:provider) { resource.provider }
+    let (:resource) do
+      Puppet::Type.type(:pki_cert_sync).new({
+        :name         => @target_dir,
+        :source       => @source_dir,
+        :provider     => 'redhat'
+      })
+    end
 
-  let (:provider) { resource.provider }
-  let (:resource) {
-    Puppet::Type.type(:tpm2_ownership).new({
-    :name         => 'tpm2',
-    :owner        => 'clear',
-    :lockout      => 'clear',
-    :endorsement  => 'clear',
-    :provider     => 'tpm2tools'
-    })}
+    describe 'copy_file' do
+      it 'should fail if source file does not exist' do
+        expect{ provider.copy_file('oops','cert_t') }.to raise_error(Errno::ENOENT, /#{Regexp.escape(File.join(@source_dir, 'oops'))}/)
 
-  describe 'get_password_options' do
-    context 'first set' do
-      let (:resource) {
-        Puppet::Type.type(:tpm2_ownership).new({
-        :name             => 'tpm2',
-        :owner_auth       => 'ownerpassword',
-        :lockout_auth     => 'lockpassword',
-        :endorsement_auth => 'endorsepassword',
-        :owner            => 'set',
-        :lockout          => 'set',
-        :endorsement      => 'clear',
-        :provider         => 'tpm2tools'
-        })}
-
-      let (:current1) {{
-        :owner       => :clear,
-        :endorsement => :clear,
-        :lockout     => :clear,
-      }}
-      it 'should return lower case options for all but endorsement' do
-        allow(Facter).to receive(:value).with(:kernel).and_return(:Linux)
-        provider = resource.provider
-        passwd_args = provider.get_passwd_options(current1,resource)
-        expect(passwd_args).to eq(['-o','ownerpassword','-l','lockpassword'])
       end
     end
-    context 'second set' do
-      # If current = set and desired = set then you must clear it and set it, hence ['-O','ownerpassword','-o','ownerpassword']
-      # If current = clear and desired = set then you need to set it, hence ['-e','endorsepassword']
-      # if current = set and desired = clear then you need to clear it, hence ['-L','lockpassword']
-      let (:resource) {
-        Puppet::Type.type(:tpm2_ownership).new({
-        :name             => 'tpm2',
-        :owner_auth       => 'ownerpassword',
-        :lockout_auth     => 'lockpassword',
-        :endorsement_auth => 'endorsepassword',
-        :owner            => 'set',
-        :lockout          => 'clear',
-        :endorsement      => 'set',
-        :in_hex           => 'true',
-        :provider         => 'tpm2tools'
-        })}
 
-      let (:current2) {{
-        :owner       => :set,
-        :endorsement => :clear,
-        :lockout     => :set,
-      }}
-      it 'should return set for all passwords' do
-        allow(Facter).to receive(:value).with(:kernel).and_return(:Linux)
-        provider = resource.provider
-        passwd_args = provider.get_passwd_options(current2,resource)
-        expect(passwd_args).to eq(['-O','ownerpassword','-o','ownerpassword','-e','endorsepassword','-L','lockpassword', '-X'])
-      end
+    describe 'file_diff' do
     end
-    context 'clear when lockout password is not set' do
-      let (:resource) {
-        Puppet::Type.type(:tpm2_ownership).new({
-        :name             => 'tpm2',
-        :owner_auth       => 'ownerpassword',
-        :lockout_auth     => 'lockpassword',
-        :endorsement_auth => 'endorsepassword',
-        :owner            => 'clear',
-        :lockout          => 'clear',
-        :endorsement      => 'clear',
-        :provider         => 'tpm2tools'
-      })}
 
-      let (:current) {{
-        :owner       => :set,
-        :endorsement => :set,
-        :lockout     => :clear,
-      }}
-      it 'should return not contain -L or -l options' do
-        allow(Facter).to receive(:value).with(:kernel).and_return(:Linux)
-        provider = resource.provider
-        passwd_args = provider.get_passwd_options(current,resource)
-        expect(passwd_args).to eq(['-O', 'ownerpassword','-E','endorsepassword'])
-      end
+    describe 'get_selinux_context' do
+    end
+
+    describe 'strip_x509_headers' do
+    end
+
+  end
+
+  # Test provider end-to-end operation to exercise the remaining methods.
+  # This is required because the rest of the methods rely upon the output of
+  # state() and internal state generated by source() and stored in provider
+  # instance variables.
+  context 'stateful methods via scenarios' do
+
+    describe 'source' do
+    end
+
+    describe 'source_insync?' do
+    end
+
+    describe 'source=' do
+    end
+
+    describe 'generate_cacerts_file' do
+    end
+
+    describe 'handle_cacerts_file' do
     end
   end
 end
