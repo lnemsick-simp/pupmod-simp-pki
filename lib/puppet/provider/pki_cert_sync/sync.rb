@@ -7,8 +7,7 @@ Puppet::Type.type(:pki_cert_sync).provide(:redhat) do
   # Returns a hash of PEM files derived from the contents of the source
   # directory
   # - Each key is a relative file path to a valid PEM file or one of
-  #   the generated, aggregate certificate PEM files, cacerts.pem and
-  #   certs_no_headers.pem
+  #   the generated, aggregate certificate PEM files
   # - The value of each key is the name of the top-level link for that
   #   PEM file.
   # - If the PEM file matches the link name, no link is required.
@@ -20,29 +19,32 @@ Puppet::Type.type(:pki_cert_sync).provide(:redhat) do
     hash_targets = {}
     @to_link = {}
     @directories = []
-    @concatted_certs = ''
 
     Dir.chdir(src) do
-      # Get all the files, but not the symlinks or cacerts.pem.
+      # Get all the files, but not the symlinks or cacerts files
       to_parse = Dir.glob('**/*').sort
       to_parse.delete_if{|x| File.symlink?(x)}
-      to_parse.delete_if{|x| x =~ /^cacerts(_no_headers)?.pem$/ }
+      to_parse.delete_if{|x| x =~ cacerts_file_regex }
 
       # Get all of the directories for later use.
       @directories = to_parse.select { |x| File.directory?(x) }
       # Remove directories from to_parse, they don't belong in to_link!
       to_parse.delete_if{|x| File.directory?(x) }
 
-      # Load each PEM file, determine what it hashes to then add its
-      # contents to expected files for cacerts.pem and cacerts_no_headers.pem
+      # Load each PEM file, determine what it hashes to, and then add its
+      # contents to reference cacerts files
       target = resource[:name]
       File.directory?(target) or Dir.mkdir(target, 0755)
-      exp_cacerts = File.open(File.join(target, '.cacerts.pem'), 'w', 0644)
-      exp_stripped_cacerts = File.open(File.join(target, '.cacerts_no_headers.pem'), 'w', 0644)
+      ref_cacerts = File.open(File.join(target, ref_file(cacerts_file)), 'w', 0644)
+      ref_stripped_cacerts = File.open(
+        File.join(target, ref_file(stripped_cacerts_file)), 'w', 0644)
 
       to_parse.sort.each do |file|
         begin
-          raw_cert = File.read(raw_cert)
+          raw_cert = File.read(file)
+          # This will only read in the first cert in a file,
+          # so we are *assuming* there will only be one in the
+          # file
           cert = OpenSSL::X509::Certificate.new(raw_cert)
         rescue OpenSSL::X509::CertificateError
           # We had a problem, skip this file.
@@ -50,8 +52,8 @@ Puppet::Type.type(:pki_cert_sync).provide(:redhat) do
           next
         end
 
-        exp_cacerts.write(raw_cert)
-        exp_stripped_certs.write(strip_x509_headers(raw_cert))
+        ref_cacerts.write(raw_cert)
+        ref_stripped_cacerts.write(strip_x509_headers(raw_cert))
 
         cert_hash = sprintf("%08x",cert.subject.hash)
         hash_targets[cert_hash] ||= Array.new
@@ -70,23 +72,23 @@ Puppet::Type.type(:pki_cert_sync).provide(:redhat) do
     hash_targets.each_key do |cert_hash|
       i = 0
       hash_targets[cert_hash].each do |file|
-        next if file =~ /^cacerts(_no_headers)?.pem$/
+        next if file =~ cacerts_file_regex
         @to_link[file] = "#{cert_hash}.#{i}"
         i += 1
       end
     end
 
     unless @to_link.empty?
-      @to_link['cacerts.pem'] = 'cacerts.pem'
-      @to_link['cacerts_no_headers.pem'] = 'cacerts_no_headers.pem'
+      @to_link[cacerts_file] = cacerts_file
+      @to_link[stripped_cacerts_file] = stripped_cacerts_file
     end
     @to_link
   ensure
-    exp_cacerts.close if exp_cacerts
-    exp_stripped_cacerts.close if exp_stripped_cacerts
+    ref_cacerts.close if defined?(ref_cacerts)
+    ref_stripped_cacerts.close if defined?(ref_stripped_cacerts)
   end
 
-  # src = Hash returned by provider's source() with the following format:
+  # src_info = Hash returned by provider's source() with the following format:
   #   {
   #     PEM_file => link
   #     PEM_file2 => link2
@@ -95,11 +97,11 @@ Puppet::Type.type(:pki_cert_sync).provide(:redhat) do
   #
   #   If the PEM file matches the link name, no link is required.
   #
-  # target = directory in which certs listed in src should be found
+  # target = directory in which certs listed in src_info should be found
   #
   # If :purge type parameter is set, the target should only contain
-  # the certs listed in src
-  def source_insync?(src,target)
+  # the certs listed in src_info
+  def source_insync?(src_info,target)
     File.directory?(target) or Dir.mkdir(target, 0755)
     insync = true
     Dir.chdir(target) do
@@ -107,7 +109,7 @@ Puppet::Type.type(:pki_cert_sync).provide(:redhat) do
       # If we're purging, and the number of files+links is different,
       # then we're not in sync.
       files = Dir.glob('**/*').select { |f| File.file?(f) }
-      if @resource.purge? and files.count != src.to_a.flatten.uniq.count
+      if @resource.purge? and files.count != src_info.to_a.flatten.uniq.count
         Puppet.debug("Different number of files from #{resource[:source]} to #{target}")
         insync = false
         break
@@ -126,7 +128,7 @@ Puppet::Type.type(:pki_cert_sync).provide(:redhat) do
 
       # If the target does not have a source file name or its link,
       # then we're not in sync.
-      src.each do |file, link|
+      src_info.each do |file, link|
         unless files.include?(file) and files.include?(link)
           Puppet.debug("Not all files in #{resource[:source]} are found in #{target}")
           insync = false
@@ -138,11 +140,11 @@ Puppet::Type.type(:pki_cert_sync).provide(:redhat) do
 
       # All expected files/links exist, but we need to verify each
       # {file,link} pair.
-      src.each do |file, link|
-        if file =~ /^cacerts(_no_headers)?.pem$/
-          # Need to compare with the expected dot file we created in the
+      src_info.each do |file, link|
+        if file =~ cacerts_file_regex
+          # Need to compare with the reference file we created in the
           # target directory in source()
-          if files_different?(".#{file}",file)
+          if files_different?(ref_file(file), file)
             Puppet.debug("#{target}/#{file} is not current")
             insync = false
             break
@@ -175,7 +177,7 @@ Puppet::Type.type(:pki_cert_sync).provide(:redhat) do
       if @resource.purge?
         # Make sure not to delete directories or certs and their symlinks that we
         # might currently be using.
-        (Dir.glob('**/*') - [@to_link.to_a].flatten - @directories.flatten).each do |to_purge|
+        (Dir.glob('**/*') - [@to_link.to_a].uniq.flatten - @directories.flatten).each do |to_purge|
           unless ([@to_link.to_a].flatten).any? { |s| s.include?(to_purge) }
             Puppet.notice("Purging '#{resource[:name]}/#{to_purge}'")
             # Use 'force' option in case a file's directory was purged first
@@ -199,13 +201,13 @@ Puppet::Type.type(:pki_cert_sync).provide(:redhat) do
 
       # Now copy over all items and link them, as appropriate.
       @to_link.each_pair do |src,link|
-        if src =~ /^cacerts(_no_headers)?.pem$/
+        if src =~ cacerts_file_regex
           if File.exist?(src)
             selinux_context = resource.get_selinux_current_context("#{resource[:name]}/#{src}")
           else
-            # The dot files were created using the default selinux context
+            # The reference files were created using the default selinux context
             # for the target directory. We're going to assume that is appropriate.
-            selinux_context = resource.get_selinux_current_context("#{resource[:name]}/.#{src}")
+            selinux_context = resource.get_selinux_current_context("#{resource[:name]}/#{ref_file(src)}")
           end
 
           selinux_context.nil? and
@@ -218,7 +220,7 @@ Puppet::Type.type(:pki_cert_sync).provide(:redhat) do
             Puppet.warning("Skipping sync of #{resource[:name]}/#{src}: Source no longer exists")
           end
         else
-          if File.exist?("#{resource[:name]}/#{src}")
+          if File.exist?("#{resource[:source]}/#{src}")
             if File.exist?(src)
               selinux_context = resource.get_selinux_current_context("#{resource[:name]}/#{src}")
             else
@@ -251,15 +253,37 @@ Puppet::Type.type(:pki_cert_sync).provide(:redhat) do
         # we create from those certs are removed, even when purging wasn't
         # enabled.
         Puppet.debug("Removing aggregate PEM files in #{resource[:name]}: No valid managed certificates")
-        FileUtils.rm_f('cacerts.pem')
-        FileUtils.rm_f('cacerts_no_headers.pem')
+        FileUtils.rm_f(cacerts_file)
+        FileUtils.rm_f(stripped_cacerts_file)
       end
     end
   end
 
+
+  # Getters for what should be constants in a normal Ruby class.
+  # Since the class name for this provider is not under our control
+  # (i.e., generated by underlying Puppet code), using simple getters
+  # is easier to maintain.
+  def cacerts_file
+    'cacerts.pem'
+  end
+
+  def stripped_cacerts_file
+    'cacerts_no_headers.pem'
+  end
+
+  def cacerts_file_regex
+    /^cacerts(_no_headers)?.pem$/
+  end
+
+  def ref_file(cacerts_filename)
+    ".#{cacerts_filename}"
+  end
+
+
   # Helper Methods
 
-  # Does a comparison of two files
+  # Compares the contents of two files
   # Returns true if either file is missing or they differ
   # Returns false if the files are the same
   def files_different?(src, dest)
@@ -287,10 +311,16 @@ Puppet::Type.type(:pki_cert_sync).provide(:redhat) do
     return retval
   end
 
-  # Strips any X.509 headers from a list of 0 or more PEM-formatted
-  # X.509 certificates
+  # Strips any X.509 headers from a string containing 0 or more,
+  # valid, PEM-formatted X.509 certificates
+  #
+  # **No checks for malformed certificates is done.**
   #
   # certs_raw = String containing list of certificates
+  #
+  # Returns stripped string when 1 or more certificates are found
+  # Returns an empty string otherwise
+  #
   def strip_x509_headers(certs_raw)
     begin_regex = /^#{Regexp.escape('-----BEGIN CERTIFICATE-----')}$/
     end_regex = /^#{Regexp.escape('-----END CERTIFICATE-----')}$/
@@ -308,6 +338,11 @@ Puppet::Type.type(:pki_cert_sync).provide(:redhat) do
         end
       end
     end
-    cert_lines.join("\n") + "\n"
+
+    certs = ''
+    unless cert_lines.empty?
+      certs = cert_lines.join("\n") + "\n"
+    end
+    certs
   end
 end
