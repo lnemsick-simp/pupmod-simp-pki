@@ -15,7 +15,6 @@ describe "#{pki_cert_sync_type}" do
       expect(resource[:name]).to eq('/etc/pki/simp_apps/app1/x509/cacerts')
       expect(resource[:source]).to eq('/etc/pki/simp/x509/cacerts')
       expect(resource.purge?).to eq(true)
-      expect(resource.strip_cacerts_headers?).to be_falsey
       expect(resource[:tag]).to eq(['pki'])
     end
 
@@ -23,13 +22,11 @@ describe "#{pki_cert_sync_type}" do
       resource = pki_cert_sync_type.new( {
         :name                  => '/etc/pki/simp_apps/app1/x509/cacerts',
         :source                => '/etc/pki/simp/x509/cacerts',
-        :purge                 => false,
-        :strip_cacerts_headers => true
+        :purge                 => false
       } )
       expect(resource[:name]).to eq('/etc/pki/simp_apps/app1/x509/cacerts')
       expect(resource[:source]).to eq('/etc/pki/simp/x509/cacerts')
       expect(resource.purge?).to be_falsey
-      expect(resource.strip_cacerts_headers?).to eq(true)
       expect(resource[:tag]).to eq(['pki'])
     end
 

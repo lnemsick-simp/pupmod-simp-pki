@@ -6,8 +6,9 @@ Puppet::Type.type(:pki_cert_sync).provide(:redhat) do
 
   # Returns a hash of PEM files derived from the contents of the source
   # directory
-  # - Each key is a relative file path to a valid PEM file or the
-  #   generated, aggregate certificate PEM file, cacerts.pem
+  # - Each key is a relative file path to a valid PEM file or one of
+  #   the generated, aggregate certificate PEM files, cacerts.pem and
+  #   certs_no_headers.pem
   # - The value of each key is the name of the top-level link for that
   #   PEM file.
   # - If the PEM file matches the link name, no link is required.
@@ -25,24 +26,32 @@ Puppet::Type.type(:pki_cert_sync).provide(:redhat) do
       # Get all the files, but not the symlinks or cacerts.pem.
       to_parse = Dir.glob('**/*').sort
       to_parse.delete_if{|x| File.symlink?(x)}
-      to_parse.delete_if{|x| x == 'cacerts.pem' }
+      to_parse.delete_if{|x| x =~ /^cacerts(_no_headers)?.pem$/ }
 
       # Get all of the directories for later use.
       @directories = to_parse.select { |x| File.directory?(x) }
       # Remove directories from to_parse, they don't belong in to_link!
       to_parse.delete_if{|x| File.directory?(x) }
 
-      # Determine what they all hash to.
-      to_parse.each do |file|
+      # Load each PEM file, determine what it hashes to then add its
+      # contents to expected files for cacerts.pem and cacerts_no_headers.pem
+      target = resource[:name]
+      File.directory?(target) or Dir.mkdir(target, 0755)
+      exp_cacerts = File.open(File.join(target, '.cacerts.pem'), 'w', 0644)
+      exp_stripped_cacerts = File.open(File.join(target, '.cacerts_no_headers.pem'), 'w', 0644)
+
+      to_parse.sort.each do |file|
         begin
-          cert = OpenSSL::X509::Certificate.new(File.read(file))
+          raw_cert = File.read(raw_cert)
+          cert = OpenSSL::X509::Certificate.new(raw_cert)
         rescue OpenSSL::X509::CertificateError
           # We had a problem, skip this file.
           Puppet.warning("File '#{file}' does not look like an X.509 certificate, skipping")
           next
         end
 
-        @concatted_certs += IO.read(file)
+        exp_cacerts.write(raw_cert)
+        exp_stripped_certs.write(strip_x509_headers(raw_cert))
 
         cert_hash = sprintf("%08x",cert.subject.hash)
         hash_targets[cert_hash] ||= Array.new
@@ -61,14 +70,20 @@ Puppet::Type.type(:pki_cert_sync).provide(:redhat) do
     hash_targets.each_key do |cert_hash|
       i = 0
       hash_targets[cert_hash].each do |file|
-        next if file == 'cacerts.pem'
+        next if file =~ /^cacerts(_no_headers)?.pem$/
         @to_link[file] = "#{cert_hash}.#{i}"
         i += 1
       end
     end
 
-    @to_link['cacerts.pem'] = 'cacerts.pem'
+    unless @to_link.empty?
+      @to_link['cacerts.pem'] = 'cacerts.pem'
+      @to_link['cacerts_no_headers.pem'] = 'cacerts_no_headers.pem'
+    end
     @to_link
+  ensure
+    exp_cacerts.close if exp_cacerts
+    exp_stripped_cacerts.close if exp_stripped_cacerts
   end
 
   # src = Hash returned by provider's source() with the following format:
@@ -86,35 +101,34 @@ Puppet::Type.type(:pki_cert_sync).provide(:redhat) do
   # the certs listed in src
   def source_insync?(src,target)
     File.directory?(target) or Dir.mkdir(target, 0755)
-
     insync = true
     Dir.chdir(target) do
 
-      # If we're purging, and the number of files is different, then we're
-      # not in sync.
+      # If we're purging, and the number of files+links is different,
+      # then we're not in sync.
       files = Dir.glob('**/*').select { |f| File.file?(f) }
       if @resource.purge? and files.count != src.to_a.flatten.uniq.count
-        Puppet.debug("Different number of files from #{resource[:source]} to #{resource[:name]}")
+        Puppet.debug("Different number of files from #{resource[:source]} to #{target}")
         insync = false
         break
       end
 
-      # If we're purging, and the list of directories is different, then we're
+      # If we're purging, and directory trees are different, then we're
       # not in sync.
       if @resource.purge?
         dirs = Dir.glob('**/*').select { |d| File.directory?(d) }
         unless dirs.uniq.sort == @directories.uniq.sort
-          Puppet.debug("Different number of directories from #{resource[:source]} to #{resource[:name]}")
+          Puppet.debug("#{resource[:source]} directory tree differs from #{target}")
           insync = false
           break
         end
       end
 
-      # If the target does not have a file name that is in the source,
+      # If the target does not have a source file name or its link,
       # then we're not in sync.
-      src.each_key do |k|
-        unless files.include?(k)
-          Puppet.debug("Not all files in #{resource[:source]} are found #{resource[:name]}")
+      src.each do |file, link|
+        unless files.include?(file) and files.include?(link)
+          Puppet.debug("Not all files in #{resource[:source]} are found in #{target}")
           insync = false
           break
         end
@@ -122,20 +136,26 @@ Puppet::Type.type(:pki_cert_sync).provide(:redhat) do
 
       break unless insync
 
-      #TODO Should we check if the link for a PEM file is missing?
-
-      # If all files have the same name, then we need to compare each one.
-      src.each_key do |file|
-        if file == 'cacerts.pem'
-          #FIXME if the existing cacerts.pem was generated with a different
-          # value of @resource.strip_cacerts_headers?, we should regenerate
-          # the cacerts.pem
+      # All expected files/links exist, but we need to verify each
+      # {file,link} pair.
+      src.each do |file, link|
+        if file =~ /^cacerts(_no_headers)?.pem$/
+          # Need to compare with the expected dot file we created in the
+          # target directory in source()
+          if files_different?(".#{file}",file)
+            Puppet.debug("#{target}/#{file} is not current")
+            insync = false
+            break
+          end
         else
-          # Don't compare if the source file no longer exists
-          # (i.e., file was removed between the time the directory was
-          # scanned and this check is being executed...)
-          if File.file?(file) && file_diff(file,"#{resource[:source]}/#{file}")
-            Puppet.debug("File contents differ between #{resource[:source]} and #{resource[:name]}")
+          if files_different?("#{resource[:source]}/#{file}", file)
+            Puppet.debug("File contents differ between #{resource[:source]} and #{target}")
+            insync = false
+            break
+          end
+
+          if !File.symlink?(link) or (File.readlink(link) != file)
+            Puppet.debug("File links in #{target} are not current")
             insync = false
             break
           end
@@ -148,20 +168,18 @@ Puppet::Type.type(:pki_cert_sync).provide(:redhat) do
   end
 
   def source=(should)
-    # If the PEM file has the same name as the link, do not create a new link,
-    # just copy the file.
 
     Dir.chdir(resource[:name]) do
 
       # Purge ALL THE THINGS
       if @resource.purge?
-        # Make sure not to delete directories or certs (and symlinks) that we might currently be using.
+        # Make sure not to delete directories or certs and their symlinks that we
+        # might currently be using.
         (Dir.glob('**/*') - [@to_link.to_a].flatten - @directories.flatten).each do |to_purge|
           unless ([@to_link.to_a].flatten).any? { |s| s.include?(to_purge) }
             Puppet.notice("Purging '#{resource[:name]}/#{to_purge}'")
-            # Ensure the file still exists.  If a file's subdirectory was purged first
-            # it won't be there.
-            FileUtils.rm_rf(to_purge) if File.exists?(to_purge)
+            # Use 'force' option in case a file's directory was purged first
+            FileUtils.rm_rf(to_purge)
           end
         end
       end
@@ -169,64 +187,87 @@ Puppet::Type.type(:pki_cert_sync).provide(:redhat) do
       # This is simply a canary file to get File['/etc/pki/cacerts'] to trigger
       # a change for all those lovely legacy files out there. Should be
       # deprecated at some point since it's basically noise.
+      # FIXME:  Is this still needed?
       FileUtils.touch('.sync_updated')
       FileUtils.chmod(0644, '.sync_updated')
       # End garbage hacky code
-
-      generate_cacerts_pem(@concatted_certs, @resource.strip_cacerts_headers?)
 
       # Take care of directories first; make them if they don't already exist.
       @directories.each do |dir|
         FileUtils.mkdir_p(dir)
       end
 
-      # Now copy over those items that differ and link them.
+      # Now copy over all items and link them, as appropriate.
       @to_link.each_pair do |src,link|
-        if File.exist?(src)
-          selinux_context = resource.get_selinux_current_context("#{resource[:name]}/#{src}")
+        if src =~ /^cacerts(_no_headers)?.pem$/
+          if File.exist?(src)
+            selinux_context = resource.get_selinux_current_context("#{resource[:name]}/#{src}")
+          else
+            # The dot files were created using the default selinux context
+            # for the target directory. We're going to assume that is appropriate.
+            selinux_context = resource.get_selinux_current_context("#{resource[:name]}/.#{src}")
+          end
+
+          selinux_context.nil? and
+            Puppet.debug("Could not get selinux context for '#{resource[:source]}/#{src}'")
+          if File.exist?(".#{src}")
+            FileUtils.cp(".#{src}",src,{:preserve => true})
+            resource.set_selinux_context("#{resource[:name]}/#{src}",selinux_context).nil? and
+              Puppet.debug("Could not set selinux context on '#{src}'")
+          else
+            Puppet.warning("Skipping sync of #{resource[:name]}/#{src}: Source no longer exists")
+          end
         else
-          selinux_context = resource.get_selinux_current_context("#{resource[:source]}/#{src}")
-        end
+          if File.exist?("#{resource[:name]}/#{src}")
+            if File.exist?(src)
+              selinux_context = resource.get_selinux_current_context("#{resource[:name]}/#{src}")
+            else
+              selinux_context = resource.get_selinux_current_context("#{resource[:source]}/#{src}")
+            end
 
-        selinux_context.nil? and
-          Puppet.debug("Could not get selinux context for '#{resource[:source]}/#{src}'")
+            selinux_context.nil? and
+              Puppet.debug("Could not get selinux context for '#{resource[:source]}/#{src}'")
 
-        unless src == 'cacerts.pem'
-          FileUtils.cp("#{resource[:source]}/#{src}",src,{:preserve => true})
-          resource.set_selinux_context("#{resource[:name]}/#{src}",selinux_context).nil? and
-            Puppet.debug("Could not set selinux context on '#{src}'")
+            FileUtils.cp("#{resource[:source]}/#{src}",src,{:preserve => true})
+            resource.set_selinux_context("#{resource[:name]}/#{src}",selinux_context).nil? and
+              Puppet.debug("Could not set selinux context on '#{src}'")
 
-          # Only link if the names are different.
-          if src != link
-            FileUtils.ln_sf(src,link)
-            # Have to set the SELinux context here too since symlinks can have
-            # different contexts than files.
-            resource.set_selinux_context("#{resource[:name]}/#{link}",selinux_context).nil? and
-              Puppet.debug("Could not set selinux context on link '#{link}'")
+            # Only link if the names are different.
+            if src != link
+              FileUtils.ln_sf(src,link)
+              # Have to set the SELinux context here too since symlinks can have
+              # different contexts than files.
+              resource.set_selinux_context("#{resource[:name]}/#{link}",selinux_context).nil? and
+                Puppet.debug("Could not set selinux context on link '#{link}'")
+            end
+          else
+            Puppet.warning("Skipping sync of #{resource[:name]}/#{src}: Source no longer exists")
           end
         end
+      end
+
+      if @to_link.empty?
+        # No managed certs. We need to make sure the aggregate PEM files
+        # we create from those certs are removed, even when purging wasn't
+        # enabled.
+        Puppet.debug("Removing aggregate PEM files in #{resource[:name]}: No valid managed certificates")
+        FileUtils.rm_f('cacerts.pem')
+        FileUtils.rm_f('cacerts_no_headers.pem')
       end
     end
   end
 
   # Helper Methods
 
-  # Ok, this is definitely not DRY since this is in concat_build. However, I
-  # haven't found a consistent way of having a common library of junk for
-  # custom types to use. Perhaps I should start collecting these into a simp
-  # package.
+  # Does a comparison of two files
+  # Returns true if either file is missing or they differ
+  # Returns false if the files are the same
+  def files_different?(src, dest)
+    # If either file is missing, it's different
+    return true unless (File.exist?(src) and File.exist?(dest))
 
-  # Does a comparison of two files and returns true if they differ and false if
-  # they do not.
-  def file_diff(src, dest)
-    unless File.exist?(src)
-      fail Puppet::Error,"Could not diff nonexistent source file #{src}."
-    end
-
-    # If the destination isn't there, it's different.
-    return true unless File.exist?(dest)
-
-    # If the sizes are different, it's different.
+    # This logic is nearly identical to that in FileUtils.compare_file(),
+    # except it hardcodes the blocksize to a small value
     return true if File.stat(src).size != File.stat(dest).size
 
     # If we've gotten here, brute force by 512B at a time. Stop when a chunk differs.
@@ -244,35 +285,6 @@ Puppet::Type.type(:pki_cert_sync).provide(:redhat) do
     s_file.close
     d_file.close
     return retval
-  end
-
-  # Generate a file containing 0 or more PEM-formatted X.509
-  # certificates in the target directory.
-  # The file will be named 'cacerts.pem'.
-  #
-  # content_raw = list of one or more PEM-formatted X.509 certificates
-  # strip_cacerts_headers = whether to strip X.509 headers
-  #
-  def generate_cacerts_pem(content_raw, strip_cacerts_headers)
-    if strip_cacerts_headers
-      content = strip_x509_headers(content_raw)
-    else
-      content = content_raw
-    end
-
-    cacerts_file = File.join(resource[:name], 'cacerts.pem')
-    if content.strip.empty?
-      Puppet.warning("File '#{cacerts_file}' is empty.")
-    end
-
-    unless File.exists?(cacerts_file)
-      File.open(cacerts_file, 'w') {|f| f.write(content)}
-      File.chmod(0644, cacerts_file)
-    else
-      !(IO.read(cacerts_file).eql? content) and
-          File.open(cacerts_file, 'w') {|f| f.write(content)}
-    end
-    #TODO Set selinux context?
   end
 
   # Strips any X.509 headers from a list of 0 or more PEM-formatted
@@ -296,6 +308,6 @@ Puppet::Type.type(:pki_cert_sync).provide(:redhat) do
         end
       end
     end
-    cert_lines.join("\n")
+    cert_lines.join("\n") + "\n"
   end
 end
