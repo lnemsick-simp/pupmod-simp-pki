@@ -1,4 +1,5 @@
 Puppet::Type.newtype(:pki_cert_sync) do
+  require 'puppet/parameter/boolean'
   require 'puppet/util/selinux'
   include Puppet::Util::SELinux
 
@@ -51,20 +52,27 @@ Puppet::Type.newtype(:pki_cert_sync) do
     end
   end
 
-  newparam(:purge, :boolean => true) do
+  newparam(:purge, :boolean => true, :parent => Puppet::Parameter::Boolean) do
     desc = <<-EOM
-      Whether or not to purge the target directory (:name). In general, you
+      Whether to purge the target directory (:name). In general, you
       will want to do this to ensure that systems do not get inappropriate
       CAs added locally.
     EOM
 
-    newvalues(:true,:false)
-    defaultto :true
+    defaultto true
+  end
+
+  newparam(:strip_cacerts_headers, :boolean => true, :parent => Puppet::Parameter::Boolean) do
+    desc = <<-EOM
+      Whether to ensure the generated, aggregate CA certificate file in the target
+      directory (`cacerts.pem`) does not contain any X.509 certificate headers.
+    EOM
+    defaultto false
   end
 
   newproperty(:source) do
     desc = <<-EOM
-      The directory into which to copy all materials. All existing materials will be removed.
+      The directory from which to copy all materials.
     EOM
 
     validate do |value|
@@ -72,6 +80,7 @@ Puppet::Type.newtype(:pki_cert_sync) do
         fail Puppet::Error, "Source directory must be an absolute path, not '#{value}'"
     end
 
+    # is = Hash of PEM files derived from the contents of the source directory.
     def insync?(is)
       # In this case, we want to compare the contents of ourself and
       # self[:name].
