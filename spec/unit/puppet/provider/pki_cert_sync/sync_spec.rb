@@ -4,7 +4,7 @@ require 'tmpdir'
 
 provider_class = Puppet::Type.type(:pki_cert_sync).provider(:redhat)
 
-def populate_cert_dir(parent_dir, cert_info, debug = false)
+def populate_cert_dir(parent_dir, cert_info)
   Dir.chdir(parent_dir) do
     cert_info.each do |file, relative_path, hash|
       dest_dir = File.join(parent_dir, relative_path)
@@ -12,15 +12,9 @@ def populate_cert_dir(parent_dir, cert_info, debug = false)
       FileUtils.cp(file, dest_dir)
     end
   end
-  puts `find #{parent_dir}` if debug
 end
 
-def validate_cert_dir(dir, cert_info, cacerts_file, cacerts_no_hdrs_file, debug = false)
-  if debug
-    puts `find #{dir} -type f | sort`
-    puts `ls -al #{dir}`
-  end
-
+def validate_cert_dir(dir, cert_info, cacerts_file, cacerts_no_hdrs_file)
   # verify each cert file was copied and its top link generated
   cert_info.each do |file, relative_path, hash|
     dest_file = File.join(dir, relative_path, File.basename(file))
