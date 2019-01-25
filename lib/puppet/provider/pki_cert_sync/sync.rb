@@ -62,9 +62,8 @@ Puppet::Type.type(:pki_cert_sync).provide(:redhat) do
       to_parse.sort.each do |file|
         begin
           raw_cert = File.read(file)
-          # This will only read in the first cert in a file,
-          # so we are *assuming* there will only be one in the
-          # file
+          # This will only read in the first cert in a file, so we are
+          # *assuming* there will only be one in the file
           cert = OpenSSL::X509::Certificate.new(raw_cert)
         rescue OpenSSL::X509::CertificateError
           # We had a problem, skip this file.
@@ -400,10 +399,9 @@ Puppet::Type.type(:pki_cert_sync).provide(:redhat) do
   #
   # When file == link, no link is required.
   #
-  # src_dir  = Fully qualified path to the root directory of the reference
-  #            file
-  # file = relative path of the certificate file to synchronize
-  # link = relative path of the link to generate
+  # src_dir = Fully qualified path to the root directory of the reference file
+  # file    = relative path of the certificate file to synchronize
+  # link    = relative path of the link to generate
   #
   def sync_cert_file(src_dir, file, link)
     target_dir = Dir.pwd
