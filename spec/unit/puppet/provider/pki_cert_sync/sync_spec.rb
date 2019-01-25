@@ -6,8 +6,7 @@ provider_class = Puppet::Type.type(:pki_cert_sync).provider(:redhat)
 
 def populate_cert_dir(parent_dir, cert_info, debug = false)
   Dir.chdir(parent_dir) do
-    cert_info.each do |info|
-      file, relative_path, hash = info
+    cert_info.each do |file, relative_path, hash|
       dest_dir = File.join(parent_dir, relative_path)
       FileUtils.mkdir_p(dest_dir)
       FileUtils.cp(file, dest_dir)
@@ -23,8 +22,7 @@ def validate_cert_dir(dir, cert_info, cacerts_file, cacerts_no_hdrs_file, debug 
   end
 
   # verify each cert file was copied and its top link generated
-  cert_info.each do |info|
-    file, relative_path, hash = info
+  cert_info.each do |file, relative_path, hash|
     dest_file = File.join(dir, relative_path, File.basename(file))
     expect( File.exist?(dest_file) ).to be true
     expect( IO.read(file) ).to eq IO.read(dest_file)
@@ -439,23 +437,39 @@ describe provider_class do
           ]
           populate_cert_dir(@source_dir, dup_cert_info)
 
+          # Create 3 more files with the same cert hash, but named <hash>.<num>:
+          # - One at beginning of num range (0)
+          # - One in the middle of the num range (3)
+          # - One outside of num range (9)
+          src = File.join(@source_dir, File.basename(cert1_file))
+          cert_hash = cert_subj_hash[:cert1]
+          FileUtils.cp(src, File.join(@source_dir, "#{cert_hash}.0"))
+          FileUtils.cp(src, File.join(@source_dir, "#{cert_hash}.3"))
+          FileUtils.cp(src, File.join(@source_dir, "#{cert_hash}.9"))
+
           # exercise provider
           its = provider.source
           expect( provider.source_insync?(its, @target_dir) ).to eq false
           provider.source = @target_dir
 
-          dup_cert_info.each_index do |index|
-            file, relative_path, hash = dup_cert_info[index]
-            dest_link = File.join(@target_dir, "#{hash}.#{index}")
-            expect( File.exist?(dest_link) ).to be true
-            expect( File.symlink?(dest_link) ).to be true
-
-            if relative_path.empty?
-              expected = File.basename(file)
-            else
-              expected = File.join(relative_path, File.basename(file))
+          Dir.chdir(@target_dir) do
+            expected = [
+              [ "#{cert_hash}.0",                                    nil ],
+              [ File.basename(cert1_file),                           "#{cert_hash}.1"],
+              [ File.basename(cert1_no_hdrs_file),                   "#{cert_hash}.2"],
+              [ "#{cert_hash}.3",                                    nil ],
+              [ File.join('dir1', File.basename(cert1_file)),         "#{cert_hash}.4"],
+              [ File.join('dir1', File.basename(cert1_no_hdrs_file)), "#{cert_hash}.5"],
+              [ "#{cert_hash}.9",                                    nil ]
+            ]
+            expected.each do |file, link|
+              expect( File.exist?(file) ).to be true
+              if link
+                expect( File.exist?(link) ).to be true
+                expect( File.symlink?(link) ).to be true
+                expect( File.readlink(link) ).to eq file
+              end
             end
-            expect( File.readlink(dest_link) ).to eq  expected
           end
         end
       end
