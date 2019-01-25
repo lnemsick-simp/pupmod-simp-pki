@@ -133,6 +133,7 @@ Puppet::Type.type(:pki_cert_sync).provide(:redhat) do
   def source_insync?(src_info,target)
     File.directory?(target) or Dir.mkdir(target, 0755)
     insync = true
+
     Dir.chdir(target) do
 
       # If we're purging, and the number of files+links is different,
@@ -217,23 +218,7 @@ Puppet::Type.type(:pki_cert_sync).provide(:redhat) do
       # Now copy over all items and link them, as appropriate.
       @to_link.each do |src,link|
         if src =~ cacerts_file_regex
-          if File.exist?(src)
-            selinux_context = resource.get_selinux_current_context("#{resource[:name]}/#{src}")
-          else
-            # The reference files were created using the default selinux context
-            # for the target directory. We're going to assume that is appropriate.
-            selinux_context = resource.get_selinux_current_context("#{resource[:name]}/#{ref_file(src)}")
-          end
-
-          selinux_context.nil? and
-            Puppet.debug("Could not get selinux context for '#{resource[:source]}/#{src}'")
-          if File.exist?(".#{src}")
-            FileUtils.cp(".#{src}",src,{:preserve => true})
-            resource.set_selinux_context("#{resource[:name]}/#{src}",selinux_context).nil? and
-              Puppet.debug("Could not set selinux context on '#{src}'")
-          else
-            Puppet.warning("Skipping sync of #{resource[:name]}/#{src}: Source no longer exists")
-          end
+          sync_cacerts_file(src)
         else
           if File.exist?("#{resource[:source]}/#{src}")
             if File.exist?(src)
@@ -404,5 +389,32 @@ Puppet::Type.type(:pki_cert_sync).provide(:redhat) do
       certs = cert_lines.join("\n") + "\n"
     end
     certs
+  end
+
+  # Synchronize the contents of the generated, aggregate CA certificates
+  # file with its reference file
+  #
+  # file = aggregate CA certificates file to sync
+  def sync_cacerts_file(file)
+    target_dir = Dir.pwd
+    ref = ref_file(file)
+    if File.exist?(ref)
+      if File.exist?(file)
+        selinux_context = resource.get_selinux_current_context("#{target_dir}/#{file}")
+      else
+        # The reference file was created using the default selinux context
+        # for the target directory. We're going to assume that is appropriate.
+        selinux_context = resource.get_selinux_current_context("#{target_dir}/#{ref}")
+      end
+
+      selinux_context.nil? and
+        Puppet.debug("Could not get selinux context for '#{target_dir}/#{file}'")
+
+      FileUtils.cp(ref, file, {:preserve => true})
+      resource.set_selinux_context("#{target_dir}/#{file}", selinux_context).nil? and
+        Puppet.debug("Could not set selinux context on '#{file}'")
+    else
+      Puppet.warning("Skipping sync of #{target_dir}/#{file}: Source no longer exists")
+    end
   end
 end
