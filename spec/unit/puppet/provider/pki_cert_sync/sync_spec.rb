@@ -73,7 +73,7 @@ describe provider_class do
     ]
   end
 
-  # Test methods that do not rely upon or set internal provider state
+  # Test some methods that do not rely upon or set internal provider state
   context 'stateless methods' do
     let(:provider) { resource.provider }
     let(:resource) do
@@ -130,10 +130,8 @@ describe provider_class do
 
   # Test remaining provider operation via sequences of source(),
   # source_insync?(), and source=() calls.  This testing approach is
-  # required because the source() method generates internal and
-  # external state info needed by the other methods.  The internal
-  # state is stored in provider instance variables.  The external
-  # state is written to dot files in the target directory.
+  # required for source_insync?() and source=(), because the source()
+  # method generates internal and external state info needed by them.
   context 'stateful methods via scenarios' do
     before(:each) do
       @tmpdir = Dir.mktmpdir
